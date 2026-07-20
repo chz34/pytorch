@@ -14,6 +14,7 @@ import torch
 import torch._inductor.codegen.common as common
 import torch.utils._pytree as pytree
 from torch._dynamo.exc import BackendCompilerFailed
+from torch._dynamo.source import ConstantSource
 from torch._dynamo.utils import same
 from torch._higher_order_ops.triton_kernel_wrap import (
     kernel_side_table,
@@ -29,9 +30,12 @@ from torch._inductor.codegen.wrapper_fxir import (
     replace_floor_div,
     WrapperFxCodegen,
 )
+from torch._inductor.graph import GraphLowering
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import fresh_cache
+from torch._inductor.virtualized import V
 from torch.export import Dim
+from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.testing._internal.common_utils import (
     DeterministicGuard,
     instantiate_parametrized_tests,
@@ -39,6 +43,7 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
+    HAS_CPU,
     HAS_GPU,
     patch_custom_fallback_pass,
     requires_gpu,
@@ -1348,6 +1353,49 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.check(TestModule(), (data, offsets))
 
 
+class FxirGraphInputTestCase(InductorTestCase):
+    """
+    Device-independent tests for FX IR wrapper graph-input codegen. These
+    exercise only Wrapper IR -> FX conversion, so they need no GPU or Triton.
+    """
+
+    def test_compound_symint_graph_input(self):
+        """
+        A backward graph can receive a saved computed symint (here s0 + 448,
+        the combined size from a forward cat) as a standalone scalar input.
+        FXIR previously raised NotImplementedError while building a placeholder
+        for such a compound sympy.Expr. This drives just the input codegen.
+        """
+
+        class MulTwo(torch.nn.Module):
+            def forward(self, x):
+                return x * 2
+
+        lowering = GraphLowering(torch.fx.symbolic_trace(MulTwo()))
+        with V.set_graph_handler(lowering):
+            s0 = V.graph.sizevars.shape_env.create_symbol(
+                40, ConstantSource("s0"), dynamic_dim=DimDynamic.DYNAMIC
+            )
+            expr = s0 + 448
+            converter = FxConverter(
+                lines=[],
+                prologue="",
+                graph_inputs={"saved_size": expr},
+                graph_outputs=[],
+                subgms={},
+                is_subgraph=False,
+            )
+            converter._generate_graph_inputs()
+
+        (placeholder,) = converter.gm.graph.find_nodes(op="placeholder")
+        self.assertEqual(placeholder.name, "saved_size")
+        val = placeholder.meta["val"]
+        self.assertIsInstance(val, torch.SymInt)
+        self.assertEqual(val.node.expr, expr)
+        # Later references to the expression resolve back to this placeholder.
+        self.assertIn(expr, converter.expr_to_proxy)
+
+
 class TestReplaceFloorDiv(InductorTestCase):
     """
     Tests for floor -> FloorDiv conversion.
@@ -1477,5 +1525,7 @@ class TestReplaceFloorDiv(InductorTestCase):
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
-    if HAS_GPU:
+    # GPU-backed classes are guarded by requires_gpu; the device-independent
+    # codegen tests still run on a CPU-only machine.
+    if HAS_GPU or HAS_CPU:
         run_tests(needs="filelock")

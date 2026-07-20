@@ -101,7 +101,29 @@ class SymbolBuffer(CodegenSymbol):
         return sym_int
 
 
-CodegenBuffer = BufferLike | SymbolBuffer
+@dataclasses.dataclass
+class ExprBuffer(CodegenSymbol):
+    """
+    Represents a compound sympy.Expr graph input, e.g. a symint like `s0 + 448`
+    that a forward saves and passes into its backward. Unlike SymbolBuffer, the
+    placeholder is named after the graph input rather than the expression, since
+    the expression string is not a valid identifier.
+    """
+
+    name: str
+    expr: sympy.Expr
+
+    def get_name(self) -> str:
+        return self.name
+
+    def get_example(self) -> torch.Tensor | torch.SymInt:
+        sym_int = convert_to_symint(self.expr)
+        if not isinstance(sym_int, torch.SymInt):
+            raise AssertionError(f"expected torch.SymInt, got {type(sym_int)}")
+        return sym_int
+
+
+CodegenBuffer = BufferLike | SymbolBuffer | ExprBuffer
 
 
 @dataclasses.dataclass
@@ -410,19 +432,30 @@ class FxConverter:
 
             # Introduce a new symbol for constant inputs.
             is_constant = isinstance(ir_node, (int, float, sympy.Integer, sympy.Float))
-            buffer = (
-                SymbolBuffer(sympy.Symbol(name, is_integer=True))
-                if is_constant
-                else self._get_buffer(ir_node)
+            # A graph input can be a compound symbolic expression, e.g. a symint
+            # like `s0 + 448` that a forward saves and passes into its backward.
+            is_sym_expr = (
+                not is_constant
+                and isinstance(ir_node, sympy.Expr)
+                and not isinstance(ir_node, sympy.Symbol)
             )
+            if is_constant:
+                buffer: CodegenBuffer = SymbolBuffer(
+                    sympy.Symbol(name, is_integer=True)
+                )
+            elif is_sym_expr:
+                buffer = ExprBuffer(name, ir_node)
+            else:
+                buffer = self._get_buffer(ir_node)
             placeholder_node = self.gm.graph.placeholder(buffer.get_name())
             placeholder_node.meta["val"] = (
                 ir_node if is_constant else buffer.get_example()
             )
             self._record_allocation(buffer, placeholder_node)
 
-            # Record symbol definitions for dynamic shapes.
-            if isinstance(ir_node, sympy.Symbol):
+            # Record symbol/expression definitions for dynamic shapes, so later
+            # references resolve to this placeholder instead of recomputing.
+            if isinstance(ir_node, sympy.Symbol) or is_sym_expr:
                 self._generate_size_proxy(placeholder_node, ir_node)
 
     def _generate_graph_input_shapes(self) -> None:
