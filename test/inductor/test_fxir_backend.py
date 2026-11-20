@@ -78,12 +78,7 @@ test_config = {
 }
 
 
-@requires_gpu_and_triton
-@config.patch(test_config)
-@instantiate_parametrized_tests
-class FxirTestCase(InductorTestCase):
-    device = GPU_TYPE
-
+class FxirTestCaseBase(InductorTestCase):
     def _count_ops(self, gm: torch.fx.GraphModule, target: Callable) -> int:
         return len(gm.graph.find_nodes(op="call_function", target=target))
 
@@ -118,7 +113,7 @@ class FxirTestCase(InductorTestCase):
                         changed = True
         return assert_nodes
 
-    def _run_and_capture_graphs(self, opt, args) -> torch.fx.GraphModule:
+    def _run_and_capture_graphs(self, opt, args) -> list[torch.fx.GraphModule]:
         gms = []
 
         orig_generate = FxConverter.generate
@@ -170,18 +165,26 @@ class FxirTestCase(InductorTestCase):
 
         self.assertTrue(same(ref, result))
 
-        # Verify all non-assertion, non-triton call_function nodes have metadata.
+        # Mutating kernel launches write into output buffers and return no value.
+        kernel_hops = (triton_kernel_wrapper_mutation, compiled_kernel_wrapper_mutation)
         for gm in gms:
             assert_nodes = self._get_assert_nodes(gm) if check_assertions else set()
             for node in gm.graph.nodes:
                 if (
                     node.op == "call_function"
-                    and node.target != triton_kernel_wrapper_mutation
+                    and node.target not in kernel_hops
                     and node not in assert_nodes
                 ):
                     self.assertTrue(node.meta.get("val", None) is not None)
 
         return gms
+
+
+@requires_gpu_and_triton
+@config.patch(test_config)
+@instantiate_parametrized_tests
+class FxirTestCase(FxirTestCaseBase):
+    device = GPU_TYPE
 
     @classmethod
     def setUpClass(cls):
@@ -2077,22 +2080,40 @@ class TestUnbackedSymbolDefs(InductorTestCase):
 
 
 @config.patch({**test_config, "fx_wrapper": True})
-class FxirCpuCompiledKernelTestCase(InductorTestCase):
+class FxirCpuCompiledKernelTestCase(FxirTestCaseBase):
     """The FX backend embeds non-Triton CPU cpp_fused_* kernels as
     compiled_kernel_wrapper_mutation HOP nodes instead of raising on them."""
 
-    def _compile_and_capture(self, func, args, **compile_kwargs):
-        gms = []
-        orig_generate = FxConverter.generate
+    def test_cpp_fused_kernel(self):
+        def foo(x, y):
+            return (x + y).relu() * 2.0
 
-        def generate(self):
-            gm = orig_generate(self)
-            gms.append(gm)
-            return gm
+        args = [torch.randn(8, 8, device="cpu") for _ in range(2)]
+        gms = self._compile_and_check(foo, args, expected_num_triton_kernels=0)
+        self.assertTrue(
+            any(self._count_ops(gm, compiled_kernel_wrapper_mutation) for gm in gms)
+        )
 
-        with unittest.mock.patch.object(FxConverter, "generate", generate):
-            result = torch.compile(func, **compile_kwargs)(*args)
+    def test_cpp_fused_kernel_with_extern(self):
+        # a @ b stays an aten extern; the pointwise tail fuses into a cpp kernel.
+        def foo(a, b):
+            return torch.relu(a @ b + a) * 2.0
 
+        args = [torch.randn(16, 16, device="cpu") for _ in range(2)]
+        gms = self._compile_and_check(foo, args, expected_num_triton_kernels=0)
+        self.assertTrue(
+            any(self._count_ops(gm, compiled_kernel_wrapper_mutation) for gm in gms)
+        )
+
+    def test_cpp_fused_kernel_dynamic_shapes(self):
+        # Dynamic shapes add sizevar args, which must reach the HOP as graph nodes.
+        def foo(x, y):
+            return (x + y).relu() * 2.0
+
+        args = [torch.randn(8, 8, device="cpu") for _ in range(2)]
+        gms = self._compile_and_check(
+            foo, args, expected_num_triton_kernels=0, compile_kwargs={"dynamic": True}
+        )
         hop_nodes = [
             node
             for gm in gms
@@ -2100,36 +2121,6 @@ class FxirCpuCompiledKernelTestCase(InductorTestCase):
                 op="call_function", target=compiled_kernel_wrapper_mutation
             )
         ]
-        return result, hop_nodes
-
-    def test_cpp_fused_kernel(self):
-        def foo(x, y):
-            return (x + y).relu() * 2.0
-
-        args = [torch.randn(8, 8) for _ in range(2)]  # cpu
-        result, hop_nodes = self._compile_and_capture(foo, args)
-        self.assertTrue(same(foo(*args), result))
-        self.assertGreater(len(hop_nodes), 0)
-
-    def test_cpp_fused_kernel_with_extern(self):
-        # a @ b stays an aten extern; the pointwise tail fuses into a cpp kernel.
-        def foo(a, b):
-            return torch.relu(a @ b + a) * 2.0
-
-        args = [torch.randn(16, 16) for _ in range(2)]  # cpu
-        result, hop_nodes = self._compile_and_capture(foo, args)
-        self.assertTrue(same(foo(*args), result))
-        self.assertGreater(len(hop_nodes), 0)
-
-    def test_cpp_fused_kernel_dynamic_shapes(self):
-        # Dynamic shapes add sizevar args, which must reach the HOP as graph nodes.
-        def foo(x, y):
-            return (x + y).relu() * 2.0
-
-        args = [torch.randn(8, 8) for _ in range(2)]  # cpu
-        result, hop_nodes = self._compile_and_capture(foo, args, dynamic=True)
-        self.assertTrue(same(foo(*args), result))
-        self.assertGreater(len(hop_nodes), 0)
 
         hop_args = [arg for node in hop_nodes for arg in node.kwargs["args"]]
         self.assertEqual(
