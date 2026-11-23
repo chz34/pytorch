@@ -6075,13 +6075,21 @@ class CppScheduling(BaseScheduling):
                     f"async_compile.cpp_pybinding({arg_types!r}, r'''"
                 )
             compile_wrapper.splice(src_code, strip=True)
+            fx_mutated_arg_indices = None
             if not V.graph.cpp_wrapper:
                 compile_wrapper.writeline("''')")
+                # cpp_argdefs() emits writable buffers as T* and inputs as const T*.
+                fx_mutated_arg_indices = tuple(
+                    i
+                    for i, arg_type in enumerate(arg_types)
+                    if arg_type.endswith("*") and not arg_type.startswith("const ")
+                )
             wrapper.define_kernel(
                 kernel_name,
                 compile_wrapper.getvalue(),
                 gpu=False,
                 cpp_definition=kernel_definition,
+                fx_mutated_arg_indices=fx_mutated_arg_indices,
             )
         return kernel_name
 

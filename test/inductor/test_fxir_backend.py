@@ -2137,6 +2137,31 @@ class FxirCpuCompiledKernelTestCase(FxirTestCaseBase):
             )
         )
 
+    def test_compiled_kernel_definition_can_target_gpu(self):
+        from torch._inductor.codegen.wrapper import KernelCallLine, KernelDefinitionLine
+
+        converter = FxConverter([], "", {}, [], {}, False)
+        definition = KernelDefinitionLine(
+            wrapper=MagicMock(spec=WrapperFxCodegen),
+            kernel_name="custom_kernel",
+            kernel_body="lambda: None",
+            gpu=True,
+            fx_mutated_arg_indices=(),
+        )
+        converter._generate_kernel_definition(definition)
+
+        call = MagicMock(spec=KernelCallLine)
+        call.kernel_name = definition.kernel_name
+        call.call_args = call.raw_args = ()
+        call.triton = False
+        converter._generate_kernel_call(call)
+
+        (node,) = converter.gm.graph.find_nodes(
+            op="call_function", target=compiled_kernel_wrapper_mutation
+        )
+        self.assertEqual(node.kwargs["mutated_arg_indices"], ())
+        self.assertIsNone(compiled_kernel_wrapper_mutation(**node.kwargs))
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests

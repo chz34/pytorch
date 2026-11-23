@@ -1645,6 +1645,8 @@ class KernelDefinitionLine(WrapperLine):
     cpp_definition: str | None = None
     standalone: bool = False
     autotune_body: str | None = None
+    # An explicit write set marks a positional compiled callable for FXIR.
+    fx_mutated_arg_indices: tuple[int, ...] | None = None
 
     def codegen(self, code: IndentedBuffer) -> None:
         self.wrapper._define_kernel_helper(
@@ -4690,6 +4692,8 @@ class PythonWrapperCodegen(CodeGen):
         cpp_definition: str | None = None,
         standalone: bool = False,
         autotune_body: str | None = None,
+        *,
+        fx_mutated_arg_indices: tuple[int, ...] | None = None,
     ):
         self.writeline(
             KernelDefinitionLine(
@@ -4701,6 +4705,7 @@ class PythonWrapperCodegen(CodeGen):
                 cpp_definition=cpp_definition,
                 standalone=standalone,
                 autotune_body=autotune_body,
+                fx_mutated_arg_indices=fx_mutated_arg_indices,
             )
         )
 
