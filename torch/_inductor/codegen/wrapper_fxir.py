@@ -338,8 +338,7 @@ class FxConverter:
             str | None, torch.fx.Node
         ] = {}  # Symbol table for codegen.
         self.kernels: dict[str, TritonKernel] = {}  # Table to store Triton kernels.
-        # Positional compiled kernels: name -> (side-table index, written arg indices).
-        self.compiled_kernels: dict[str, tuple[int, tuple[int, ...]]] = {}
+        self.compiled_kernels: dict[str, int] = {}  # Name to side-table index.
         self._unique_symbol_ids: Counter[str] = Counter()
         self.tracer = torch.fx.proxy.GraphAppendingTracer(graph)
         self.expr_to_proxy: dict[sympy.Expr, torch.fx.Proxy] = {}
@@ -1442,18 +1441,15 @@ class FxConverter:
     def _generate_kernel_call(self, line: WrapperLine) -> None:
         if not isinstance(line, KernelCallLine):
             raise AssertionError(f"expected KernelCallLine, got {type(line)}")
-        if line.kernel_name in self.compiled_kernels:
+        if line.triton:
+            self._generate_triton_call(line)
+        else:
             self._generate_compiled_kernel_call(line)
-            return
-        if not line.triton:
-            raise NotImplementedError(
-                f"FX conversion has no compiled definition for kernel {line.kernel_name}"
-            )
-
-        self._generate_triton_call(line)
 
     def _generate_compiled_kernel_call(self, line: KernelCallLine) -> None:
-        kernel_idx, mutated_arg_indices = self.compiled_kernels[line.kernel_name]
+        kernel_idx = self.compiled_kernels[line.kernel_name]
+        backend = V.graph.scheduler.get_backend(line.device)
+        mutated_arg_indices = backend.get_fx_kernel_mutated_arg_indices(line)
         # _lookup_args returns a bare sympy.Expr for a SymbolicCallArg; lift those
         # to real graph edges, as the Triton call path does for its call kwargs.
         args = tuple(
@@ -1484,21 +1480,21 @@ class FxConverter:
         if isinstance(kernel, LambdaFuture):
             kernel = kernel.result()
 
-        if line.fx_mutated_arg_indices is not None:
-            if not callable(kernel):
-                raise TypeError(f"Expected a callable for kernel {line.kernel_name}")
-            idx = compiled_kernel_side_table.add_kernel(kernel)
-            self.compiled_kernels[line.kernel_name] = (idx, line.fx_mutated_arg_indices)
-            return
-
-        if not isinstance(kernel, CachingAutotuner):
-            raise NotImplementedError(
-                f"FX conversion for kernel {line.kernel_name} of type {type(kernel)} "
-                "requires a Triton kernel or explicit FX mutation metadata"
+        if isinstance(kernel, CachingAutotuner):
+            # Parallel compile workers strip the Python function from the JITFunction.
+            kernel._ensure_kernel_loaded()
+            self.kernels[line.kernel_name] = TritonKernel(
+                kernel, wrap_triton(kernel.fn)
             )
-        # Parallel compile workers strip the Python function from the JITFunction.
-        kernel._ensure_kernel_loaded()
-        self.kernels[line.kernel_name] = TritonKernel(kernel, wrap_triton(kernel.fn))
+        elif callable(kernel):
+            self.compiled_kernels[line.kernel_name] = (
+                compiled_kernel_side_table.add_kernel(kernel)
+            )
+        else:
+            raise NotImplementedError(
+                f"FX conversion requires a Triton kernel or callable for {line.kernel_name}, "
+                f"got {type(kernel)}"
+            )
 
     def _generate_symbolic_call_arg(self, line: WrapperLine) -> None:
         if not isinstance(line, SymbolicCallArgLine):

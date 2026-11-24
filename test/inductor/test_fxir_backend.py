@@ -2137,30 +2137,38 @@ class FxirCpuCompiledKernelTestCase(FxirTestCaseBase):
             )
         )
 
-    def test_compiled_kernel_definition_can_target_gpu(self):
-        from torch._inductor.codegen.wrapper import KernelCallLine, KernelDefinitionLine
+    def test_compiled_kernel_uses_registered_backend(self):
+        from torch._inductor.codegen.cpp import CppScheduling
 
-        converter = FxConverter([], "", {}, [], {}, False)
-        definition = KernelDefinitionLine(
-            wrapper=MagicMock(spec=WrapperFxCodegen),
-            kernel_name="custom_kernel",
-            kernel_body="lambda: None",
-            gpu=True,
-            fx_mutated_arg_indices=(),
-        )
-        converter._generate_kernel_definition(definition)
+        writes = []
 
-        call = MagicMock(spec=KernelCallLine)
-        call.kernel_name = definition.kernel_name
-        call.call_args = call.raw_args = ()
-        call.triton = False
-        converter._generate_kernel_call(call)
+        class CustomScheduling(CppScheduling):
+            def get_fx_kernel_mutated_arg_indices(self, line):
+                indices = super().get_fx_kernel_mutated_arg_indices(line)
+                writes.append(indices)
+                return indices
 
-        (node,) = converter.gm.graph.find_nodes(
+        common.init_backend_registration()
+        with (
+            unittest.mock.patch.dict(common.device_codegens),
+            unittest.mock.patch.dict(common.custom_backend_passes),
+            unittest.mock.patch.dict(common.custom_backend_codegen_configs),
+        ):
+            common.register_backend_for_device(
+                "cpu",
+                CustomScheduling,
+                PythonWrapperCodegen,
+                device_fx_wrapper_codegen=WrapperFxCodegen,
+            )
+            args = [torch.randn(8, device="cpu") for _ in range(2)]
+            (gm,) = self._compile_and_check(
+                torch.add, args, expected_num_triton_kernels=0
+            )
+
+        (node,) = gm.graph.find_nodes(
             op="call_function", target=compiled_kernel_wrapper_mutation
         )
-        self.assertEqual(node.kwargs["mutated_arg_indices"], ())
-        self.assertIsNone(compiled_kernel_wrapper_mutation(**node.kwargs))
+        self.assertEqual(writes, [node.kwargs["mutated_arg_indices"]])
 
 
 if __name__ == "__main__":
