@@ -17,6 +17,7 @@ import torch.utils._pytree as pytree
 from torch._C._dynamo.guards import assert_alignment, assert_size_stride
 from torch._dynamo.utils import same
 from torch._higher_order_ops.compiled_kernel_wrap import (
+    compiled_kernel_wrapper_functional,
     compiled_kernel_wrapper_mutation,
 )
 from torch._higher_order_ops.triton_kernel_wrap import (
@@ -37,6 +38,7 @@ from torch._inductor.runtime.runtime_utils import assert_tensor_metadata
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import fresh_cache
 from torch.export import Dim
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.common_utils import (
     DeterministicGuard,
     instantiate_parametrized_tests,
@@ -2089,10 +2091,24 @@ class FxirCpuCompiledKernelTestCase(FxirTestCaseBase):
             return (x + y).relu() * 2.0
 
         args = [torch.randn(8, 8, device="cpu") for _ in range(2)]
-        gms = self._compile_and_check(foo, args, expected_num_triton_kernels=0)
-        self.assertTrue(
-            any(self._count_ops(gm, compiled_kernel_wrapper_mutation) for gm in gms)
+        (gm,) = self._compile_and_check(foo, args, expected_num_triton_kernels=0)
+        (mutation,) = gm.graph.find_nodes(
+            op="call_function", target=compiled_kernel_wrapper_mutation
         )
+        hop_fields = {"kernel_idx", "args", "mutated_arg_indices"}
+        self.assertEqual(set(mutation.kwargs), hop_fields)
+
+        functional = torch.func.functionalize(gm)
+        functional_gm = make_fx(functional, tracing_mode="fake")(*args)
+        (functional_node,) = functional_gm.graph.find_nodes(
+            op="call_function", target=compiled_kernel_wrapper_functional
+        )
+        self.assertEqual(set(functional_node.kwargs) - {"tensor_bases"}, hop_fields)
+        self.assertEqual(
+            functional_node.kwargs["mutated_arg_indices"],
+            mutation.kwargs["mutated_arg_indices"],
+        )
+        self.assertEqual(functional_gm(*args), gm(*args))
 
     def test_cpp_fused_kernel_with_extern(self):
         # a @ b stays an aten extern; the pointwise tail fuses into a cpp kernel.
