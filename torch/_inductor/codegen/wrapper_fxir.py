@@ -1,18 +1,24 @@
+import contextlib
 import dataclasses
 import functools
 import logging
 import operator
 import textwrap
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Any
 
 import sympy
 
 import torch
+from torch._C._dynamo.guards import assert_alignment, assert_size_stride
 from torch._export.passes._node_metadata_hook import (
     _node_metadata_hook,
     _set_node_metadata_hook,
+)
+from torch._higher_order_ops.compiled_kernel_wrap import (
+    compiled_kernel_side_table,
+    compiled_kernel_wrapper_mutation,
 )
 from torch._higher_order_ops.triton_kernel_wrap import (
     TraceableTritonKernelWrapper,
@@ -20,7 +26,9 @@ from torch._higher_order_ops.triton_kernel_wrap import (
     triton_kernel_wrapper_mutation,
 )
 from torch._inductor.codecache import LambdaFuture, PyCodeCache
+from torch._inductor.runtime.runtime_utils import assert_tensor_metadata
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+from torch._inductor.scheduler import BaseScheduling
 from torch._inductor.select_algorithm import extern_kernels  # noqa: F401
 from torch._inductor.utils import convert_to_symint
 from torch._inductor.virtualized import V
@@ -50,6 +58,7 @@ from .common import (
 from .wrapper import (
     AllocateLine,
     AssertAlignmentLine,
+    AssertSizeStrideLine,
     BufferLike,
     CommentLine,
     DynamicScalarLine,
@@ -61,16 +70,21 @@ from .wrapper import (
     ExternKernelOutLine,
     FreeIfNotReusedLine,
     FreeLine,
+    GroupedAssertSizeStrideLine,
     IndexPutFallbackLine,
     KernelCallLine,
     KernelDefinitionLine,
     Line,
     MultiOutputLine,
+    NanAssertLine,
     NullLine,
+    ProfilerMarkerLine,
     PythonWrapperCodegen,
     ReinterpretLine,
     ReuseLine,
+    ScalarAssertLine,
     ScatterFallbackLine,
+    SizeAssertLine,
     SubgraphPythonWrapperCodegen,
     SwitchLine,
     SymbolicCallArg,
@@ -119,6 +133,23 @@ class TritonKernel:
 
     tuner: CachingAutotuner
     wrapped: TraceableTritonKernelWrapper
+
+
+def _supports_compiled_kernel_fxir(scheduling: BaseScheduling) -> bool:
+    r"""_supports_compiled_kernel_fxir(scheduling) -> bool
+
+    Check that the scheduling implements every required compiled-kernel FXIR hook.
+    Inherited implementations count, but BaseScheduling placeholders do not.
+    Kernel loading and callable validation remain the FX converter's responsibility.
+
+    Args:
+        scheduling (BaseScheduling): The active scheduling backend.
+    """
+    for method in (BaseScheduling.get_fx_kernel_mutated_arg_indices,):
+        implementation = getattr(type(scheduling), method.__name__, None)
+        if not callable(implementation) or implementation is method:
+            return False
+    return True
 
 
 def replace_floor_div(expr: sympy.Expr) -> sympy.Expr:
@@ -243,6 +274,16 @@ class WrapperFxCodegen(PythonWrapperCodegen):
         """
         PythonWrapperCodegen.write_header(self)
 
+    def _codegen_input_size_assert(self, name: str, buf: ir.IRNode) -> None:
+        self.writeline(
+            SizeAssertLine(
+                self, name, list(buf.get_size()), list(buf.get_stride()), "input"
+            )
+        )
+
+    def _codegen_input_nan_assert(self, name: str) -> None:
+        self.writeline(NanAssertLine(self, name))
+
     def register_alignment_check_inputs(self) -> None:
         """FXIR does not emit deferred alignment copies.
         Alignment is handled by the runtime wrapper."""
@@ -306,41 +347,19 @@ class FxConverter:
     is_subgraph: bool
 
     def __post_init__(self) -> None:
+        torch.fx.node.has_side_effect(assert_alignment)
+        torch.fx.node.has_side_effect(assert_size_stride)
+        torch.fx.node.has_side_effect(assert_tensor_metadata)
         graph = torch.fx.Graph()
         self.gm = GraphModule({}, graph)  # Wrapper FX IR.
         self.buffer_to_node: dict[
             str | None, torch.fx.Node
         ] = {}  # Symbol table for codegen.
         self.kernels: dict[str, TritonKernel] = {}  # Table to store Triton kernels.
+        self.compiled_kernels: dict[str, int] = {}  # Name to side-table index.
         self._unique_symbol_ids: Counter[str] = Counter()
         self.tracer = torch.fx.proxy.GraphAppendingTracer(graph)
         self.expr_to_proxy: dict[sympy.Expr, torch.fx.Proxy] = {}
-
-    def _import_kernel(self, code: str, kernel_name: str) -> CachingAutotuner:
-        """
-        Imports a kernel from source, possibly autotuning block parameters.
-        """
-        module_code = "\n".join([self.prologue, code])
-        mod = PyCodeCache.load(module_code)
-        kernel = getattr(mod, kernel_name)
-
-        if isinstance(kernel, LambdaFuture):
-            kernel = kernel.result()
-
-        if not isinstance(kernel, CachingAutotuner):
-            raise NotImplementedError(
-                textwrap.dedent(f"""
-                Unsupported type for kernel {kernel_name}: {type(kernel)}.
-                FX conversion only supports Triton kernels.
-            """)
-            )
-
-        # Parallel compile workers strip the Python function from the pickled
-        # JITFunction. FXIR stores the JITFunction in the Triton HOP side table,
-        # so reload it in the parent before runtime execution can need it.
-        kernel._ensure_kernel_loaded()
-
-        return kernel
 
     def _create_as_strided(
         self,
@@ -627,6 +646,10 @@ class FxConverter:
         output_nodes = [
             self._generate_buffer(node) for idx, node in enumerate(self.graph_outputs)
         ]
+        if config.nan_asserts:
+            for node in OrderedSet(output_nodes):
+                if node is not None and isinstance(node.meta.get("val"), torch.Tensor):
+                    self._generate_nan_assert_for_node(node)
 
         # Parent graphs with single return elements don't use a tuple.
         output_value = (
@@ -665,14 +688,24 @@ class FxConverter:
         """
         Main entrypoint for FX codegen.
         """
+        for line in self.lines:
+            if isinstance(line, KernelCallLine) and not line.triton:
+                backend = V.graph.scheduler.get_backend(line.device)
+                if not _supports_compiled_kernel_fxir(backend):
+                    raise NotImplementedError(
+                        f"{type(backend).__name__} does not implement the scheduling "
+                        f"interfaces required for compiled-kernel FXIR "
+                        f"({line.kernel_name} on {line.device})"
+                    )
+
         self._generate_graph_inputs()
         self._generate_graph_constants()
         self._generate_subgm_getattrs()
 
-        with _set_node_metadata_hook(
-            self.gm,
-            functools.partial(_node_metadata_hook, fake_mode=V.fake_mode),
-        ):
+        self._metadata_hook = functools.partial(
+            _node_metadata_hook, fake_mode=V.fake_mode
+        )
+        with _set_node_metadata_hook(self.gm, self._metadata_hook):
             self._generate_graph_input_shapes()
 
             # Generate FX IR from Wrapper IR lines.
@@ -699,6 +732,14 @@ class FxConverter:
         self.gm.graph.output(output)
         self.gm.recompile()
         return self.gm
+
+    @contextlib.contextmanager
+    def _without_metadata_hook(self) -> Iterator[None]:
+        self.gm._unregister_create_node_hook(self._metadata_hook)
+        try:
+            yield
+        finally:
+            self.gm._register_create_node_hook(self._metadata_hook)
 
     def _sympy_interp(self, expr: sympy.Expr) -> torch.fx.Proxy:
         # hash cons
@@ -836,11 +877,35 @@ class FxConverter:
         self._record_allocation(ir_node, fx_node)
 
     def _generate_assert_size_stride(self, line: WrapperLine) -> None:
-        pass
+        dtype = None
+        if isinstance(line, (SizeAssertLine, AssertSizeStrideLine)):
+            asserts = [(line.name, line.size, line.stride)]
+            if isinstance(line, AssertSizeStrideLine):
+                dtype = line.dtype
+        elif isinstance(line, GroupedAssertSizeStrideLine):
+            asserts = line.asserts
+        else:
+            raise AssertionError(f"expected a size/stride assertion, got {type(line)}")
+
+        for name, size, stride in asserts:
+            args: tuple[Any, ...] = (
+                self.buffer_to_node[name],
+                tuple(self._generate_sym_nodes(size)),
+                tuple(self._generate_sym_nodes(stride)),
+            )
+            assert_fn = (
+                assert_tensor_metadata if dtype is not None else assert_size_stride
+            )
+            if dtype is not None:
+                args = (*args, dtype, line.op_name)
+            elif line.op_name is not None:
+                args = (*args, line.op_name)
+            # These eager helpers cannot inspect symbolic fake tensor metadata.
+            with self._without_metadata_hook():
+                node = self.gm.graph.call_function(assert_fn, args)
+                node.meta["val"] = None if dtype is not None else True
 
     def _generate_assert_alignment(self, line: WrapperLine) -> None:
-        from torch._C._dynamo.guards import assert_alignment
-
         if not isinstance(line, AssertAlignmentLine):
             raise AssertionError(f"expected AssertAlignmentLine, got {type(line)}")
         self.gm.graph.call_function(
@@ -852,6 +917,43 @@ class FxConverter:
         if not isinstance(line, CommentLine):
             raise AssertionError(f"expected CommentLine, got {type(line)}")
         # We ignore comments in FX IR.
+
+    def _generate_profiler_marker(self, line: WrapperLine) -> None:
+        if not isinstance(line, ProfilerMarkerLine):
+            raise AssertionError(f"expected ProfilerMarkerLine, got {type(line)}")
+        # Profiler markers are emitted only by the Python wrapper.
+
+    def _generate_nan_assert(self, line: WrapperLine) -> None:
+        if not isinstance(line, NanAssertLine):
+            raise AssertionError(f"expected NanAssertLine, got {type(line)}")
+        self._generate_nan_assert_for_node(
+            self.buffer_to_node[line.name], line.tensor_name
+        )
+
+    def _generate_nan_assert_for_node(
+        self, buffer_node: torch.fx.Node, tensor_name: str | None = None
+    ) -> None:
+        graph = self.gm.graph
+
+        def assert_not_any(mask: torch.fx.Node, message: str) -> None:
+            any_set = graph.call_function(aten.any.default, (mask,))
+            item = graph.call_function(aten.item.default, (any_set,))
+            graph.call_function(
+                torch._assert, (graph.call_function(operator.not_, (item,)), message)
+            )
+
+        # Fake tensors cannot evaluate item(), so skip metadata propagation.
+        with self._without_metadata_hook():
+            for op, kind in ((aten.isnan.default, "NaN"), (aten.isinf.default, "Inf")):
+                message = f"{tensor_name} contains {kind}" if tensor_name else ""
+                assert_not_any(graph.call_function(op, (buffer_node,)), message)
+
+    def _generate_scalar_assert(self, line: WrapperLine) -> None:
+        if not isinstance(line, ScalarAssertLine):
+            raise AssertionError(f"expected ScalarAssertLine, got {type(line)}")
+        value = self._sympy_interp(line.scalar)
+        condition = value.node if isinstance(value, torch.fx.Proxy) else value
+        self.gm.graph.call_function(aten._assert_scalar.default, (condition, line.msg))
 
     def _generate_dynamic_scalar(self, line: WrapperLine) -> None:
         if not isinstance(line, DynamicScalarLine):
@@ -1182,7 +1284,14 @@ class FxConverter:
                 elif not hinted(arg):
                     can_tune = False
                     break
-            if can_tune:
+            if (line.inductor_meta or {}).get("asserts_need_real_inputs"):
+                # Tuning runs the kernel on zeros, which need not hold what its device
+                # asserts check, and a failed device assert leaves the device unusable.
+                log.info(
+                    "Skipping compile-time autotuning for kernel %s, which has device asserts.",
+                    kernel_name,
+                )
+            elif can_tune:
                 tune_kernel(tuner, call_args)
             else:
                 log.info(
@@ -1202,15 +1311,16 @@ class FxConverter:
             call_args: Sequence[Any], cfg: Config
         ) -> tuple[Any, ...]:
             """
-            Add constant kwargs to the arg list.
+            Add constant kwargs to the launcher's arg list.
             """
-            # Add args from the proper Triton signature.
+            # Name the args after the launcher's signature, which leaves out
+            # constexprs on newer Triton versions.
             # Exclude constants and config kwargs, as those are tracked separately.
             new_call_args = []
             constants = triton_meta["constants"]
             call_kwargs = {
                 key: val
-                for key, val in zip(signature, call_args)
+                for key, val in zip(tuner._launcher_arg_names(cfg), call_args)
                 # pyrefly: ignore [missing-attribute]
                 if key not in constants and key not in cfg.kwargs
             }
@@ -1224,18 +1334,15 @@ class FxConverter:
                 if key not in cfg.kwargs
             ]
 
-            # Add Inductor's extra launcher args to the end.
-            if extra_launcher_args := tuner.inductor_meta.get("extra_launcher_args"):
-                new_call_args.extend(
-                    call_args[len(call_args) - len(extra_launcher_args) :]
-                )
-
             return tuple(new_call_args)
 
         kernel_config = tuner.compile_results[0].config
         extra_options = getattr(kernel_config, "extra_options", None)
-        call_args = add_constants_to_call_args(call_args, kernel_config)
+        # The grid is read from the args as the launcher receives them, with
+        # Inductor's extra launcher args at the end, so read it before the
+        # constants are added back.
         call_args, grid = tuner._interpret_args_grid(call_args, kernel_config)
+        call_args = add_constants_to_call_args(call_args, kernel_config)
         call_kwargs = dict(zip(signature, call_args))
         # pyrefly: ignore [missing-attribute]
         if any(kwarg in kernel_config.kwargs for kwarg in call_kwargs):
@@ -1362,24 +1469,60 @@ class FxConverter:
     def _generate_kernel_call(self, line: WrapperLine) -> None:
         if not isinstance(line, KernelCallLine):
             raise AssertionError(f"expected KernelCallLine, got {type(line)}")
-        if not line.triton:
-            raise NotImplementedError("FX conversion only supports Triton kernels.")
+        if line.triton:
+            self._generate_triton_call(line)
+        else:
+            self._generate_compiled_kernel_call(line)
 
-        self._generate_triton_call(line)
+    def _generate_compiled_kernel_call(self, line: KernelCallLine) -> None:
+        kernel_idx = self.compiled_kernels[line.kernel_name]
+        backend = V.graph.scheduler.get_backend(line.device)
+        mutated_arg_indices = backend.get_fx_kernel_mutated_arg_indices(line)
+        # _lookup_args returns a bare sympy.Expr for a SymbolicCallArg; lift those
+        # to real graph edges, as the Triton call path does for its call kwargs.
+        args = tuple(
+            self._generate_sym_node(arg) if isinstance(arg, sympy.Expr) else arg
+            for arg in self._lookup_args(line.call_args, line.raw_args)
+        )
+        self.gm.graph.call_function(
+            compiled_kernel_wrapper_mutation,
+            kwargs={
+                "kernel_idx": kernel_idx,
+                "mutated_arg_indices": mutated_arg_indices,
+                "args": args,
+            },
+        )
 
     def _generate_kernel_definition(self, line: WrapperLine) -> None:
         if not isinstance(line, KernelDefinitionLine):
             raise AssertionError(f"expected KernelDefinitionLine, got {type(line)}")
 
-        # Generate code for the kernel.
         kernel_code = PythonWrapperCodegen._format_kernel_definition(
-            line.kernel_name, line.kernel_body, metadata=line.metadata
+            line.kernel_name,
+            line.kernel_body,
+            metadata=line.metadata,
+            standalone=line.standalone,
         )
+        mod = PyCodeCache.load("\n".join([self.prologue, kernel_code]))
+        kernel = getattr(mod, line.kernel_name)
+        if isinstance(kernel, LambdaFuture):
+            kernel = kernel.result()
 
-        # Import the module and store the JIT kernel.
-        tuner = self._import_kernel(kernel_code, line.kernel_name)
-        wrapped = wrap_triton(tuner.fn)
-        self.kernels[line.kernel_name] = TritonKernel(tuner, wrapped)
+        if isinstance(kernel, CachingAutotuner):
+            # Parallel compile workers strip the Python function from the JITFunction.
+            kernel._ensure_kernel_loaded()
+            self.kernels[line.kernel_name] = TritonKernel(
+                kernel, wrap_triton(kernel.fn)
+            )
+        elif callable(kernel):
+            self.compiled_kernels[line.kernel_name] = (
+                compiled_kernel_side_table.add_kernel(kernel)
+            )
+        else:
+            raise NotImplementedError(
+                f"FX conversion requires a Triton kernel or callable for {line.kernel_name}, "
+                f"got {type(kernel)}"
+            )
 
     def _generate_symbolic_call_arg(self, line: WrapperLine) -> None:
         if not isinstance(line, SymbolicCallArgLine):

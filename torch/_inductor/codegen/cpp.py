@@ -11,7 +11,7 @@ import sys
 import warnings
 from collections.abc import Callable, Sequence
 from enum import Enum
-from typing import Any, cast, ClassVar, Literal, Optional
+from typing import Any, cast, ClassVar, Literal, Optional, TYPE_CHECKING
 
 import sympy
 
@@ -88,6 +88,10 @@ from .cpp_utils import (
 
 
 _IS_WINDOWS = sys.platform == "win32"
+
+
+if TYPE_CHECKING:
+    from .wrapper import KernelCallLine
 
 
 @functools.cache
@@ -647,7 +651,7 @@ def arith_promoted(op, a, b):
 
 
 class CppOverrides(OpOverrides):
-    """Map element-wise ops to C++"""
+    """Map element-wise ops to scalar C++ expressions (CppVecOverrides is the vectorized version)"""
 
     @staticmethod
     def add(a, b):
@@ -797,11 +801,15 @@ class CppOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sqrt(x):
+        if config.cpp.sqrt_without_errno:
+            return f"sqrt_without_errno({x})"
         return f"std::sqrt({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def rsqrt(x):
+        if config.cpp.sqrt_without_errno:
+            return f"1 / sqrt_without_errno({x})"
         return f"1 / std::sqrt({x})"
 
     @staticmethod
@@ -1333,6 +1341,8 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def exp(x):
+        if config.cpp.vec_exp_u20 and x.dtype == torch.float:
+            return f"{x}.exp_u20()"
         return f"{x}.exp()"
 
     @staticmethod
@@ -3475,6 +3485,8 @@ class CppVecKernel(CppKernel):
                 vec_dtype = torch.float if is_bool else dtype
                 vec = f"at::vec::Vectorized<{DTYPE_TO_CPP[vec_dtype]}>"
                 vec_reduce_all_func = f"at::vec::vec_reduce_all<{DTYPE_TO_CPP[vec_dtype]}, {self._get_num_vectors(vec_dtype)}>"
+                if config.cpp.simd_horizontal_reduction:
+                    vec_reduce_all_func = f"simd_vec_reduce_all<{DTYPE_TO_CPP[vec_dtype]}, {self._get_num_vectors(vec_dtype)}>"
                 result_vec = f"{acc_vec}"
                 if use_acc_helper:
                     if reduction_type != "sum":
@@ -5127,6 +5139,16 @@ class CppScheduling(BaseScheduling):
     @classmethod
     def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
         return cls.backend_features
+
+    def get_fx_kernel_mutated_arg_indices(
+        self, line: "KernelCallLine"
+    ) -> tuple[int, ...]:
+        # cpp_argdefs() emits writable buffers as T* and inputs as const T*.
+        return tuple(
+            i
+            for i, arg_type in enumerate(line.arg_types)
+            if arg_type.endswith("*") and not arg_type.startswith("const ")
+        )
 
     def __init__(self, scheduler):
         super().__init__(scheduler)
